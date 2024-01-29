@@ -1,0 +1,3 @@
+google-play-scraper
+pytz
+infi.clickhouse_orm
