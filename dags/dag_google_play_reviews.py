@@ -25,9 +25,7 @@ with DAG(
     load_data_task = PythonOperator(
         task_id="load_data",
         python_callable=load_data,
-        op_kwargs={
-            "clickhouse_http": Connection.get_connection_from_secrets(
-                "clickhouse_http_debug"
-            ),
-        },
+        op_kwargs=dict(
+            clickhouse_http=Connection.get_connection_from_secrets("clickhouse_http"),
+        ),
     )

@@ -1,15 +1,20 @@
+import logging
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime
+from sqlite3 import Connection as SqliteConnection
 from typing import Any, Dict, Iterable
 
+import clickhouse_connect
 import pytz
+from clickhouse_connect.driver.client import Client as ClickhouseClient
 from google_play_scraper import Sort, reviews
-from infi.clickhouse_orm import database, engines, fields, models
 
 APP_ID = "org.telegram.messenger"
 LANGS = ("ru", "en")
-MINDATE_EXCL = date(2023, 12, 31)  # Минимальная дата для загрузки, исключительно
+MINDATE_EXCL = date(2023, 12, 31)  # Минимальная дата для загрузки
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,26 +36,13 @@ class CdmRecord:
     min_score: float
     avg_score: float
     max_score: float
-    insert_date: date
-    insert_datetime: datetime
 
+    def __setattr__(self, __name: str, __value: Any) -> None:
+        """Sqlite конвертирует date в str, обратная конверсия"""
 
-class PublicReview(models.Model):
-    """Класс, описывающий витрину для infi.clickhouse_orm"""
-
-    event_date = fields.DateField()
-    language = fields.StringField()
-    reviews_count = fields.Int64Field()
-    min_score = fields.Float32Field()
-    avg_score = fields.Float32Field()
-    max_score = fields.Float32Field()
-    insert_date = fields.DateField()
-    insert_datetime = fields.DateTimeField()
-    engine = engines.MergeTree("event_date", order_by=("event_date", "language"))
-
-    @classmethod
-    def table_name(cls):
-        return "public_reviews"
+        if __name == "event_date" and isinstance(__value, str):
+            __value = datetime.strptime(__value, "%Y-%m-%d")
+        object.__setattr__(self, __name, __value)
 
 
 def make_raw_record(api_record: Dict, language: str) -> RawRecord:
@@ -68,8 +60,8 @@ def browse_api(
     language: str,
     start_date_excl: date,
     end_date_excl: date,
-) -> Iterable:
-    """Чтение записей из API"""
+) -> Iterable[RawRecord]:
+    """Чтение записей из API Google Play"""
 
     api_result, continuation_token = reviews(
         app_id, lang=language, sort=Sort.NEWEST, count=3
@@ -96,38 +88,49 @@ class GooglePlayReviews:
         app_id=APP_ID,
         langs=LANGS,
     ) -> None:
+        self.clickhouse_http = clickhouse_http
         self.end_date_excl = end_date_excl
         self.app_id = app_id
         self.langs = langs
-        self.insert_datetime = datetime.now(pytz.utc)
-        self.insert_date = self.insert_datetime.date()
-        self.clickhouse = database.Database(
-            db_name=clickhouse_http.schema,
-            db_url=f"{clickhouse_http.host}:{clickhouse_http.port}",
-            username=clickhouse_http.login,
-            password=clickhouse_http.password,
-            autocreate=False,
-            timeout=600,
+
+    def _sqlite_client(self) -> SqliteConnection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _clickhouse_client(self) -> ClickhouseClient:
+        return clickhouse_connect.get_client(
+            host=self.clickhouse_http.host,
+            username=self.clickhouse_http.login,
+            password=self.clickhouse_http.password or "",
+            port=self.clickhouse_http.port,
+            database=self.clickhouse_http.schema,
         )
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
-        max_event_date = self._get_max_loaded_date()
-        with sqlite3.connect(":memory:") as self.conn:
-            self.conn.row_factory = sqlite3.Row
-            self._make_raw_table()
-            self._load_raw_records(max_event_date)
-            self._insert_cdm_records(self._read_cdm_records())
+    def __call__(self):
+        with self._sqlite_client() as self.conn, self._clickhouse_client() as self.clickhouse:
+            self.insert_datetime = datetime.now(pytz.utc)
+            self.insert_date = self.insert_datetime.date()
+            for language in self.langs:
+                max_event_date = self._get_max_loaded_date(language)
+                logger.info(f"language={language}, max_event_date={max_event_date}")
+                self._make_raw_table()
+                self._extract_raw_records(max_event_date, language)
+                cdm_records = self._transform_to_cdm_records()
+                self._load_cdm_records(cdm_records)
 
-    def _get_max_loaded_date(self) -> date:
-        """Возвращает максимально загруженную дату из витрины"""
+    def _get_max_loaded_date(self, language: str) -> date:
+        """Возвращает максимально загруженную дату из витрины для указанного языка"""
 
-        rows = self.clickhouse.select(
+        result = self.clickhouse.query(
             """
-            SELECT max(event_date) AS  max_event_date FROM public_reviews
-            """
+            SELECT max(event_date) AS  max_event_date 
+            FROM public_reviews
+            WHERE language = {lang:String}
+            """,
+            parameters=dict(lang=language),
         )
-        row = next(rows)
-        return row.max_event_date
+        return result.result_rows[0][0]
 
     def _make_raw_table(self):
         """Создание пустой RAW таблицы"""
@@ -145,27 +148,26 @@ class GooglePlayReviews:
         )
         self.conn.commit()
 
-    def _load_raw_records(self, max_event_date):
+    def _extract_raw_records(self, max_event_date: date, language: str):
         """Загрузка RAW записей"""
 
         cursor = self.conn.cursor()
-        for language in self.langs:
-            for raw_record in browse_api(
-                app_id=self.app_id,
-                language=language,
-                start_date_excl=max(MINDATE_EXCL, max_event_date),
-                end_date_excl=self.end_date_excl,
-            ):
-                cursor.execute(
-                    """
-                    INSERT INTO raw_records (event_date, language, score) 
-                    VALUES (:event_date, :language, :score)
-                    """,
-                    asdict(raw_record),
-                )
+        for raw_record in browse_api(
+            app_id=self.app_id,
+            language=language,
+            start_date_excl=max(MINDATE_EXCL, max_event_date),
+            end_date_excl=self.end_date_excl,
+        ):
+            cursor.execute(
+                """
+                INSERT INTO raw_records (event_date, language, score) 
+                VALUES (:event_date, :language, :score)
+                """,
+                asdict(raw_record),
+            )
         self.conn.commit()
 
-    def _read_cdm_records(self) -> Iterable:
+    def _transform_to_cdm_records(self) -> Iterable[CdmRecord]:
         """Расчет и поставка записей для витрины"""
 
         cursor = self.conn.cursor()
@@ -184,32 +186,25 @@ class GooglePlayReviews:
             """
         )
         for record in cursor.fetchall():
-            yield PublicReview(
-                **dict(
-                    **dict(record),
-                    insert_date=self.insert_date,
-                    insert_datetime=self.insert_datetime,
-                )
-            )
+            yield CdmRecord(**dict(record))
 
-    def _insert_cdm_records(self, cdm_records: Iterable):
+    def _load_cdm_records(self, cdm_records: Iterable[CdmRecord]):
         """Вставка записей в витрину"""
 
-        self.clickhouse.insert(cdm_records)
+        cdm_fields = [f.name for f in fields(CdmRecord)]
 
+        def prep_row(rows):
+            """Трансформация потока Cdm записей в список, пригодный для загрузки"""
+            nonlocal cdm_fields
+            for row in rows:
+                yield [getattr(row, c) for c in cdm_fields] + [
+                    self.insert_datetime,
+                    self.insert_date,
+                ]
 
-if __name__ == "__main__":
-    """Для теста"""
-
-    @dataclass
-    class Clickhouse_http:
-        schema = "default"
-        host = "http://localhost"
-        port = "8123"
-        login = "default"
-        password = None
-
-    GooglePlayReviews(
-        clickhouse_http=Clickhouse_http(),
-        end_date_excl=datetime.now(pytz.utc).date(),
-    )()
+        data = list(prep_row(cdm_records))
+        self.clickhouse.insert(
+            "public_reviews",
+            data,
+            column_names=cdm_fields + ["insert_datetime", "insert_date"],
+        )

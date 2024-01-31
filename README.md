@@ -1,44 +1,39 @@
 # task-gpreviews
 
-## Зависимости
-Python 3.9
-Aitflow 
+Загрузка данных по ревью приложения в Google Play, расчет витрины и загрузка ее в Clickhouse.
 
-## Тестирование
+В dags/google_play_review_lib/etl.py указаны неизменяемые параметры загрузки:
 
-### Clickhouse
+```python
+APP_ID = "org.telegram.messenger"
+LANGS = ("ru", "en")
+MINDATE_EXCL = date(2023, 12, 31)  # Минимальная дата для загрузки
+```
 
+Загрузка осуществляется начиная с даты последней записи в витрине плюс один до сегодняшнего дня исключительно. Первая
+загрузка начнется с даты MINDATE_EXCL.
+
+## Запуск DAG
+
+Запуск Airflow
 ```shell
-cd ./clickhouse
+docker-compose build
 docker-compose up -d
 ```
 
-### Установка Airflow
-```shell
-pip install "apache-airflow==2.8.1" --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.1/constraints-3.9.txt"
-```
+Web-интерфей Airflow http://localhost:8080
 
-```shell
-export AIRFLOW_HOME=~/airflow
-airflow standalone
-```
+    user: airflow
+    password: airflow
 
-UI: http://localhost:8080
-user: admin
-password: смотри в AIRFLOW_HOME
+Создать Connection:
 
-```shell
-cd ~/airflow
-ln -s /Users/vik-a-makarov/mine/task-gpreviews/dags dags
-```
+    Connection Id: clickhouse_http
+    Connection Type: Generic
+    Host:
+    Schema:
+    Login:
+    Password:
+    Port:
 
-
-Запуск DAG
-```shell
-# run your first task instance
-airflow tasks test example_bash_operator runme_0 2015-01-01
-# run a backfill over 2 days
-airflow dags backfill example_bash_operator \
-    --start-date 2015-01-01 \
-    --end-date 2015-01-02
-```
+Включить DAG google_play_reviews. Первый раз стартует сразу автоматически, затем по расписанию каждый день в 5 утро UTC.

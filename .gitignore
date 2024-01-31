@@ -1,5 +1,10 @@
-clickhouse/db
+local_tests/clickhouse/db/
 sqlite.db
+logs/
+t/
+config/
+plugins/
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
