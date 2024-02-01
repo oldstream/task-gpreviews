@@ -64,7 +64,7 @@ def browse_api(
     """Чтение записей из API Google Play"""
 
     api_result, continuation_token = reviews(
-        app_id, lang=language, sort=Sort.NEWEST, count=3
+        app_id, lang=language, sort=Sort.NEWEST, count=100
     )  # type: ignore
     while api_result:
         for api_record in api_result:
